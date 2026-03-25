@@ -15,8 +15,9 @@
 7. [完整调用链详解](#7-完整调用链详解)
 8. [数据流与 I/O 处理](#8-数据流与-io-处理)
 9. [异步执行机制](#9-异步执行机制)
-10. [新图像 SR 模型集成步骤](#10-新图像-sr-模型集成步骤)
-11. [附录：关键数据结构参考](#11-附录关键数据结构参考)
+10. [大尺寸图片分块 SR 处理分析](#10-大尺寸图片分块-sr-处理分析)
+11. [新图像 SR 模型集成步骤](#11-新图像-sr-模型集成步骤)
+12. [附录：关键数据结构参考](#12-附录关键数据结构参考)
 
 ---
 
@@ -994,6 +995,111 @@ if (isPlanarYUV(in_frame->format))
     copy_uv_planes(ctx, out_frame, in_frame);
 ```
 
+### 8.5 I/O 处理中的 Image Copy 详解
+
+在整个 SR 推理路径中，图像数据经历了多次复制操作。以下是所有 image copy 的完整清单：
+
+#### 8.5.1 dnn_io_proc.c 中的数据复制
+
+**`ff_proc_from_frame_to_dnn()`（输入帧 → DNN 数据）：**
+
+| 行号 | 操作 | 复制内容 | 触发条件 |
+|------|------|---------|---------|
+| L251-255 | `sws_scale()` | RGB24/BGR24 → GBRP 平面数据 | NCHW 布局的 RGB 输入 |
+| L273-276 | `sws_scale()` | packed → float/UINT8 格式转换 | RGB24/BGR24 输入 |
+| L280-282 | `av_image_copy_plane()` | GRAYF32 帧数据直接复制 | GRAYF32 格式直通 |
+| L306-309 | `sws_scale()` | Y 通道 GRAY8 → float 格式 | YUV/GRAY8/NV12 输入 |
+
+**`ff_proc_from_dnn_to_frame()`（DNN 数据 → 输出帧）：**
+
+| 行号 | 操作 | 复制内容 | 触发条件 |
+|------|------|---------|---------|
+| L101-103 | `sws_scale()` | 输出数据格式转换（RGB） | RGB24/BGR24 输出 |
+| L131-135 | `sws_scale()` | GBRP 平面 → packed RGB24/BGR24 | NCHW 布局的 RGB 输出 |
+| L140-142 | `av_image_copy_plane()` | GRAYF32 数据直接复制 | GRAYF32 格式直通 |
+| L166-168 | `sws_scale()` | GRAYF32 → GRAY8 转换 | YUV/GRAY8 输出 |
+
+**`ff_frame_to_dnn_detect()`（检测预处理）：**
+
+| 行号 | 操作 | 复制内容 |
+|------|------|---------|
+| L466-467 | `sws_scale()` | 全帧缩放到模型输入尺寸 + 格式转换 |
+
+**`ff_frame_to_dnn_classify()`（分类预处理）：**
+
+| 行号 | 操作 | 复制内容 |
+|------|------|---------|
+| L414-416 | `sws_scale()` | Bounding box 区域裁剪 + 缩放到模型输入尺寸 |
+
+#### 8.5.2 vf_dnn_processing.c 中的数据复制
+
+**`activate()`（主处理循环）：**
+
+| 行号 | 操作 | 复制内容 |
+|------|------|---------|
+| L305 | `av_frame_copy_props()` | 帧元数据（pts、时间基等，非像素数据） |
+
+**`copy_uv_planes()`（UV 通道复制/缩放）：**
+
+| 行号 | 操作 | 复制内容 | 触发条件 |
+|------|------|---------|---------|
+| L233-235 | `av_image_copy_plane()` ×2 | U、V 平面直接复制 | 输入输出尺寸相同 |
+| L238-239 | `sws_scale()` | NV12 UV 交织平面缩放 | NV12 + 尺寸变化（SR 场景） |
+| L241-244 | `sws_scale()` ×2 | U、V 平面分别缩放 | YUV420P 等 + 尺寸变化 |
+
+#### 8.5.3 dnn_backend_openvino.c 中的数据复制
+
+**`fill_model_input_ov()`（填充输入张量）：**
+
+| 行号 | 操作 | 说明 |
+|------|------|------|
+| L291 | `ov_tensor_data()` | 获取张量数据指针（**内存映射，非复制**） |
+| L306-309 | 调用 `ff_proc_from_frame_to_dnn()` | 间接触发 dnn_io_proc 中的复制 |
+
+**`infer_completion_callback()`（推理完成回调）：**
+
+| 行号 | 操作 | 说明 |
+|------|------|------|
+| L366 | `ov_tensor_data()` | 获取输出张量指针（**内存映射，非复制**） |
+| L450 | 调用 `ff_proc_from_dnn_to_frame()` | 间接触发 dnn_io_proc 中的复制 |
+
+> ⚠ 注意：`ov_tensor_data()` 返回的是 OpenVINO 内部内存的指针，是零拷贝的内存映射操作。实际的数据复制发生在 `dnn_io_proc.c` 的 `sws_scale()` 和 `av_image_copy_plane()` 调用中。
+
+#### 8.5.4 典型 SR 推理路径的完整 Copy 链
+
+以 YUV420P 输入、4x SR 模型为例：
+
+```
+输入帧 (AVFrame, YUV420P, 640×480)
+  │
+  ├── [Copy 1] av_frame_copy_props(): 复制帧属性到输出帧
+  │
+  ├── [Copy 2] sws_scale() in ff_proc_from_frame_to_dnn():
+  │     Y 通道 GRAY8 → GRAYF32（格式转换 + 归一化）
+  │     ov_tensor_data() 返回目标指针（零拷贝映射）
+  │
+  │   ═══ OpenVINO 推理引擎执行 ═══
+  │
+  ├── [Copy 3] sws_scale() in ff_proc_from_dnn_to_frame():
+  │     GRAYF32 → GRAY8（反归一化 + 格式转换）
+  │     ov_tensor_data() 返回源指针（零拷贝映射）
+  │
+  ├── [Copy 4] sws_scale() in copy_uv_planes():
+  │     U 通道缩放 (320×240 → 1280×960)
+  │
+  └── [Copy 5] sws_scale() in copy_uv_planes():
+        V 通道缩放 (320×240 → 1280×960)
+
+输出帧 (AVFrame, YUV420P, 2560×1920)
+```
+
+**总计：5 次数据复制操作**（1 次属性复制 + 2 次格式转换 + 2 次 UV 缩放）
+
+对于 RGB24 输入 + NCHW 模型布局，复制次数更多（需要额外的 packed↔planar 转换）：
+- 输入路径：packed RGB → planar GBR（1次） → 归一化（1次）= 2 次
+- 输出路径：反归一化（1次） → planar GBR → packed RGB（1次）= 2 次
+- 总计约 **5-6 次数据复制操作**
+
 ---
 
 ## 9. 异步执行机制
@@ -1062,9 +1168,145 @@ if (ctx->nireq <= 0) {
 
 ---
 
-## 10. 新图像 SR 模型集成步骤
+## 10. 大尺寸图片分块 SR 处理分析
 
-### 10.1 概述
+### 10.1 当前状态：不支持分块处理
+
+经过对 FFmpeg DNN 模块源码的全面检索，**FFmpeg 当前不支持分块（tile-based）超分辨率处理**。具体证据如下：
+
+- 在所有 DNN 相关文件中（`libavfilter/dnn/*.c`、`libavfilter/vf_dnn_*.c`），未找到任何与 "tile"、"block"、"patch"、"crop"（分块裁剪）、"overlap"（重叠）、"split"（分割）、"chunk" 相关的逻辑
+- `DFT_PROCESS_FRAME` 功能类型的定义注释为 "process the whole frame"（处理整帧）
+- `vf_dnn_processing.c` 的 `activate()` 函数对每帧调用一次 `ff_dnn_execute_model()`，不做任何分块
+
+### 10.2 全帧处理的代码证据
+
+```c
+// vf_dnn_processing.c :: activate() — 每帧完整处理，无分块
+do {
+    ret = ff_inlink_consume_frame(inlink, &in);
+    if (ret > 0) {
+        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+        av_frame_copy_props(out, in);
+        // 整帧送入模型推理，无分块逻辑
+        if (ff_dnn_execute_model(&ctx->dnnctx, in, out) != 0) {
+            return AVERROR(EIO);
+        }
+    }
+} while (ret > 0);
+```
+
+### 10.3 相关选项澄清
+
+**`input_resizable` 不是分块功能：**
+
+该选项允许模型接受可变尺寸的输入，但它的实现是重塑（reshape）模型输入维度，而非将图片分块：
+
+```c
+// dnn_backend_openvino.c :: get_input_ov()
+if (input_resizable) {
+    input->dims[dnn_get_width_idx_by_layout(input->layout)] = -1;
+    input->dims[dnn_get_height_idx_by_layout(input->layout)] = -1;
+}
+
+// dnn_backend_openvino.c :: get_output_ov() — reshape 模型输入
+status = ov_model_reshape_single_input(ov_model->ov_model, partial_shape);
+```
+
+**`batch_size` 不是分块功能：**
+
+OpenVINO 2.0 后端已明确不支持 batch_size > 1：
+
+```c
+// dnn_backend_openvino.c :: init_model_ov()
+if (ctx->ov_option.batch_size > 1) {
+    avpriv_report_missing_feature(ctx, "Do not support batch_size > 1 for now,"
+                                       "change batch_size to 1.\n");
+    ctx->ov_option.batch_size = 1;
+}
+```
+
+### 10.4 大尺寸图片处理的限制
+
+对于大尺寸图片的 SR 处理，当前存在以下限制：
+
+1. **内存限制**：整帧加载到模型中，对于 4K/8K 图片，内存需求巨大（例如 4K RGB 输入 ≈ 24MB，4x SR 输出 ≈ 384MB，加上模型中间层可能需要数 GB）
+2. **模型限制**：某些模型（如 SwinIR 的 Transformer 架构）对大尺寸输入的计算复杂度呈二次增长
+3. **无边界重叠**：缺少分块之间的重叠和融合机制，即使外部分块也可能出现块边界伪影
+
+### 10.5 变通方案
+
+虽然 FFmpeg 内部不支持分块，但可以通过以下方式处理大尺寸图片：
+
+**方案 A：FFmpeg 滤镜链外部分块**
+
+```bash
+# 1. 将大图切成小块（使用 crop 滤镜）
+ffmpeg -i large_image.png -vf "crop=256:256:0:0" tile_0_0.png
+ffmpeg -i large_image.png -vf "crop=256:256:256:0" tile_1_0.png
+# ... 对每个块执行
+
+# 2. 对每个块执行 SR
+ffmpeg -i tile_0_0.png -vf \
+  "dnn_processing=dnn_backend=openvino:model=sr.xml:input=x:output=y" \
+  tile_0_0_sr.png
+
+# 3. 使用外部工具拼接（FFmpeg 内无自动拼接+融合功能）
+```
+
+> ⚠ 此方案的主要问题是块边界处可能出现伪影，需要在外部实现重叠-裁剪（overlap-crop）策略。
+
+**方案 B：使用 `input_resizable` 直接处理**
+
+如果模型支持动态输入且内存足够，可以直接处理大图：
+
+```bash
+ffmpeg -i large_image.png -vf \
+  "dnn_processing=dnn_backend=openvino:\
+   model=sr.xml:input=x:output=y:\
+   input_resizable=1" \
+  output_sr.png
+```
+
+**方案 C：外部 Python 脚本分块处理**
+
+推荐对于需要分块的场景，使用 Python + OpenVINO 直接实现分块+重叠+融合：
+
+```python
+import numpy as np
+import openvino as ov
+
+def tile_sr(image, model_path, tile_size=256, overlap=16, scale=4):
+    core = ov.Core()
+    model = core.compile_model(model_path, "CPU")
+    h, w = image.shape[:2]
+    output = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
+
+    for y in range(0, h, tile_size - overlap):
+        for x in range(0, w, tile_size - overlap):
+            # 提取带重叠的块
+            tile = image[y:y+tile_size, x:x+tile_size]
+            # 推理
+            result = model(tile)[0]
+            # 融合到输出（裁剪重叠区域）
+            # ... 融合逻辑
+    return output
+```
+
+### 10.6 潜在的未来改进方向
+
+如果要在 FFmpeg 中实现原生分块 SR 支持，需要：
+
+1. 在 `vf_dnn_processing.c` 的 `activate()` 函数中添加分块逻辑
+2. 实现重叠裁剪策略（overlap-crop），避免块边界伪影
+3. 添加结果拼接和融合功能
+4. 新增滤镜选项：`tile_size`、`tile_overlap`
+5. 处理 YUV 格式下色度子采样对齐问题
+
+---
+
+## 11. 新图像 SR 模型集成步骤
+
+### 11.1 概述
 
 在 FFmpeg 中集成一个新的图像超分辨率（SR）模型主要涉及以下工作：
 
@@ -1075,7 +1317,7 @@ if (ctx->nireq <= 0) {
 
 对于大多数标准 SR 模型（单图像输入、单图像输出），**无需修改 FFmpeg 源代码**，只需使用现有的 `dnn_processing` 滤镜即可。
 
-### 10.2 详细步骤
+### 11.2 详细步骤
 
 #### 步骤 1：模型准备与转换
 
@@ -1342,7 +1584,7 @@ ffmpeg -i input.mp4 -vf \
   -benchmark -y output.mp4
 ```
 
-### 10.3 高级集成场景
+### 11.3 高级集成场景
 
 #### 10.3.1 使用 GPU 推理
 
@@ -1380,7 +1622,7 @@ ffmpeg -i input.mp4 -vf \
   -y output.mp4
 ```
 
-### 10.4 集成检查清单
+### 11.4 集成检查清单
 
 | # | 检查项 | 说明 |
 |---|--------|------|
@@ -1395,7 +1637,7 @@ ffmpeg -i input.mp4 -vf \
 | 9 | ✅ 异步推理 | 建议启用 `async=1` 并设置合适的 `nireq` |
 | 10 | ✅ 设备选择 | 根据硬件选择 CPU/GPU/VPU |
 
-### 10.5 常见 SR 模型集成示例
+### 11.5 常见 SR 模型集成示例
 
 #### SRCNN (Y 通道，TensorFlow 原始模型)
 
@@ -1423,6 +1665,29 @@ ffmpeg -i input.mp4 -vf \
 
 #### Real-ESRGAN (RGB 3通道, 4x 放大)
 
+> **关于 Real-ESRGAN 集成说明**：FFmpeg **没有** Real-ESRGAN 的专用实现代码。Real-ESRGAN 通过通用的 `dnn_processing` 滤镜加载，与其他所有 SR 模型（EDSR、SwinIR 等）使用完全相同的代码路径。用户只需将 Real-ESRGAN 模型转换为 OpenVINO IR 格式（.xml + .bin），然后通过以下命令使用：
+
+**模型准备步骤**：
+
+```bash
+# 1. 获取 Real-ESRGAN 的 PyTorch 模型
+# 2. 导出为 ONNX
+python -c "
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+model.load_state_dict(torch.load('RealESRGAN_x4plus.pth')['params_ema'])
+model.eval()
+torch.onnx.export(model, torch.randn(1,3,64,64), 'realesrgan_x4.onnx',
+                  input_names=['input'], output_names=['output'],
+                  dynamic_axes={'input':{2:'h',3:'w'}, 'output':{2:'h',3:'w'}})
+"
+# 3. 转换为 OpenVINO IR
+mo --input_model realesrgan_x4.onnx --output_dir ./
+```
+
+**FFmpeg 使用命令**：
+
 ```bash
 ffmpeg -i input.mp4 -vf \
   "format=rgb24,\
@@ -1436,6 +1701,8 @@ ffmpeg -i input.mp4 -vf \
    nireq=2" \
   -y output_realesrgan.mp4
 ```
+
+> ⚠ **注意**：Real-ESRGAN 模型较大（RRDBNet 约 64MB），对于大尺寸输入帧，内存消耗可能很高。如遇内存不足问题，考虑降低输入分辨率或参考第 10 节的变通方案。
 
 #### SwinIR (RGB 3通道, 轻量级 SR)
 
@@ -1453,9 +1720,9 @@ ffmpeg -i input.mp4 -vf \
 
 ---
 
-## 11. 附录：关键数据结构参考
+## 12. 附录：关键数据结构参考
 
-### 11.1 数据类型枚举
+### 12.1 数据类型枚举
 
 ```c
 typedef enum {DNN_FLOAT = 1, DNN_UINT8 = 4} DNNDataType;
@@ -1473,7 +1740,7 @@ typedef enum {
 } DNNLayout;
 ```
 
-### 11.2 异步状态
+### 12.2 异步状态
 
 ```c
 typedef enum {
@@ -1484,7 +1751,7 @@ typedef enum {
 } DNNAsyncStatusType;
 ```
 
-### 11.3 任务结构
+### 12.3 任务结构
 
 ```c
 typedef struct TaskItem {
@@ -1506,7 +1773,7 @@ typedef struct LastLevelTaskItem {
 } LastLevelTaskItem;
 ```
 
-### 11.4 构建系统集成
+### 12.4 构建系统集成
 
 ```makefile
 # libavfilter/dnn/Makefile
