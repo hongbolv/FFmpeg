@@ -18,6 +18,7 @@
 10. [大尺寸图片分块 SR 处理分析](#10-大尺寸图片分块-sr-处理分析)
 11. [新图像 SR 模型集成步骤](#11-新图像-sr-模型集成步骤)
 12. [附录：关键数据结构参考](#12-附录关键数据结构参考)
+13. [Real-ESRGAN x4plus 完整集成实践](#13-real-esrgan-x4plus-完整集成实践)
 
 ---
 
@@ -1962,4 +1963,719 @@ OBJS-$(CONFIG_DNN)                    += $(DNN-OBJS-yes)
 
 ---
 
-*本文档基于 FFmpeg 源码分析生成，涵盖了 libavfilter → DNN Interface → OpenVINO Backend → OpenVINO C Library 的完整调用链，以及新图像 SR 模型的集成方法。*
+## 13. Real-ESRGAN x4plus 完整集成实践
+
+本节提供 Real-ESRGAN x4plus 模型在 FFmpeg + OpenVINO 中的端到端集成指南，参考 [Real-ESRGAN 官方仓库](https://github.com/xinntao/Real-ESRGAN) 和 [OpenVINO 文档](https://docs.openvino.ai/)。
+
+### 13.1 Real-ESRGAN x4plus 模型概述
+
+**论文**：[Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data](https://arxiv.org/abs/2107.10833)（ICCVW 2021）
+
+**模型架构**：RRDBNet（Residual-in-Residual Dense Block Network）
+
+| 参数 | 值 |
+|------|-----|
+| 架构 | RRDBNet（23 个 RRDB blocks） |
+| 输入通道 | 3（RGB） |
+| 输出通道 | 3（RGB） |
+| 特征维度 | num_feat=64, num_grow_ch=32 |
+| 放大倍数 | 4× |
+| 模型大小 | ~64 MB（FP32），~16.7M 参数 |
+| 输入范围 | [0, 1]（float32 归一化） |
+| 输出范围 | [0, 1]（float32 归一化） |
+| 输入布局 | NCHW（PyTorch 默认） |
+| 权重文件 | `RealESRGAN_x4plus.pth`（[下载链接](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth)） |
+
+**RRDBNet 架构图**：
+
+```
+Input (3ch) → Conv → 23× RRDB Block → Conv → Upsample(2×) → Conv → Upsample(2×) → Conv → Conv → Output (3ch)
+                      ↓                                          ↑
+                   [Dense Block ×3]                        [PixelShuffle ×2]
+                   每个 Dense Block 包含
+                   5 个 Conv+LeakyReLU 层
+```
+
+**模型家族**（Real-ESRGAN 仓库提供的所有变体）：
+
+| 模型名 | 架构 | blocks | 放大 | 用途 |
+|--------|------|--------|------|------|
+| `RealESRGAN_x4plus` | RRDBNet | 23 | 4× | 通用图片 |
+| `RealESRNet_x4plus` | RRDBNet | 23 | 4× | 通用图片（无 GAN） |
+| `RealESRGAN_x4plus_anime_6B` | RRDBNet | 6 | 4× | 动漫图片（轻量） |
+| `RealESRGAN_x2plus` | RRDBNet | 23 | 2× | 2× 放大 |
+| `realesr-animevideov3` | SRVGGNetCompact | 16 conv | 4× | 动漫视频（极轻量） |
+| `realesr-general-x4v3` | SRVGGNetCompact | 32 conv | 4× | 通用视频（轻量） |
+
+### 13.2 环境准备
+
+#### 13.2.1 PyTorch 环境（模型导出用）
+
+```bash
+# 创建独立 Python 环境
+conda create -n realesrgan python=3.10
+conda activate realesrgan
+
+# 安装 PyTorch
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# 安装 Real-ESRGAN 及其依赖
+pip install basicsr realesrgan
+
+# 安装 OpenVINO 开发工具（模型转换）
+pip install openvino-dev[onnx]
+```
+
+#### 13.2.2 FFmpeg 编译环境
+
+```bash
+# 安装 OpenVINO Runtime（参考 https://docs.openvino.ai/）
+# Ubuntu/Debian:
+apt install libopenvino-dev
+# 或从源码安装：
+# git clone https://github.com/openvinotoolkit/openvino.git
+# cd openvino && mkdir build && cd build
+# cmake .. -DCMAKE_BUILD_TYPE=Release
+# make -j$(nproc) && sudo make install
+
+# 编译 FFmpeg（启用 OpenVINO）
+cd /path/to/ffmpeg
+./configure --enable-libopenvino
+make -j$(nproc)
+```
+
+### 13.3 模型转换：PyTorch → ONNX → OpenVINO IR
+
+#### 步骤 1：下载预训练权重
+
+```bash
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
+     -O RealESRGAN_x4plus.pth
+```
+
+#### 步骤 2：PyTorch → ONNX
+
+创建导出脚本 `export_realesrgan_x4plus.py`：
+
+```python
+#!/usr/bin/env python3
+"""Export Real-ESRGAN x4plus model to ONNX format for OpenVINO conversion.
+
+Reference: https://github.com/xinntao/Real-ESRGAN
+Model: RealESRGAN_x4plus (RRDBNet, 23 RRDB blocks, 4x upscale)
+"""
+
+import torch
+import argparse
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+
+def export_onnx(weights_path, output_path, input_height=480, input_width=640,
+                dynamic=True, opset=11):
+    """
+    Export RealESRGAN_x4plus to ONNX.
+
+    Args:
+        weights_path: Path to RealESRGAN_x4plus.pth
+        output_path: Output ONNX file path
+        input_height: Default input height (used for static shape)
+        input_width: Default input width (used for static shape)
+        dynamic: Whether to use dynamic spatial dimensions
+        opset: ONNX opset version
+    """
+    # Define model architecture (must match training configuration)
+    # Reference: inference_realesrgan.py L66-69
+    model = RRDBNet(
+        num_in_ch=3,      # RGB input
+        num_out_ch=3,      # RGB output
+        num_feat=64,       # Feature channels
+        num_block=23,      # Number of RRDB blocks
+        num_grow_ch=32,    # Growth channels in dense block
+        scale=4            # 4x upscale factor
+    )
+
+    # Load pretrained weights
+    state_dict = torch.load(weights_path, map_location='cpu')
+    # Real-ESRGAN stores weights under 'params_ema' key
+    if 'params_ema' in state_dict:
+        state_dict = state_dict['params_ema']
+    elif 'params' in state_dict:
+        state_dict = state_dict['params']
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+
+    # Create dummy input: [batch=1, channels=3, height, width]
+    # Input range: [0, 1] (float32)
+    dummy_input = torch.rand(1, 3, input_height, input_width)
+
+    # Dynamic axes configuration
+    dynamic_axes = None
+    if dynamic:
+        dynamic_axes = {
+            'input':  {0: 'batch', 2: 'height', 3: 'width'},
+            'output': {0: 'batch', 2: 'out_height', 3: 'out_width'}
+        }
+
+    # Export to ONNX
+    torch.onnx.export(
+        model,
+        dummy_input,
+        output_path,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes=dynamic_axes,
+        opset_version=opset,
+        do_constant_folding=True
+    )
+    print(f"Exported ONNX model to: {output_path}")
+    print(f"  Input:  [1, 3, {input_height}, {input_width}] (dynamic={dynamic})")
+    print(f"  Output: [1, 3, {input_height*4}, {input_width*4}] (4x upscale)")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Export Real-ESRGAN x4plus to ONNX')
+    parser.add_argument('--weights', type=str, default='RealESRGAN_x4plus.pth',
+                        help='Path to pretrained weights')
+    parser.add_argument('--output', type=str, default='realesrgan_x4plus.onnx',
+                        help='Output ONNX file path')
+    parser.add_argument('--height', type=int, default=480, help='Input height')
+    parser.add_argument('--width', type=int, default=640, help='Input width')
+    parser.add_argument('--static', action='store_true',
+                        help='Use static shape (no dynamic axes)')
+    parser.add_argument('--opset', type=int, default=11, help='ONNX opset version')
+    args = parser.parse_args()
+
+    export_onnx(args.weights, args.output, args.height, args.width,
+                dynamic=not args.static, opset=args.opset)
+```
+
+运行导出：
+
+```bash
+python export_realesrgan_x4plus.py \
+    --weights RealESRGAN_x4plus.pth \
+    --output realesrgan_x4plus.onnx \
+    --height 480 --width 640
+```
+
+#### 步骤 3：ONNX → OpenVINO IR
+
+**方法 A：使用 OpenVINO Model Converter（推荐）**
+
+```bash
+# OpenVINO 2023+ 使用 ovc (OpenVINO Converter)
+ovc realesrgan_x4plus.onnx \
+    --output_model realesrgan_x4plus.xml
+
+# 旧版本使用 mo (Model Optimizer)
+# mo --input_model realesrgan_x4plus.onnx --output_dir ./
+```
+
+**方法 B：使用 Python API 直接转换**
+
+```python
+import openvino as ov
+
+# 读取 ONNX 模型
+core = ov.Core()
+model = core.read_model("realesrgan_x4plus.onnx")
+
+# 查看模型信息
+print("Inputs:")
+for inp in model.inputs:
+    print(f"  {inp.any_name}: shape={inp.partial_shape}, "
+          f"type={inp.element_type}")
+print("Outputs:")
+for out in model.outputs:
+    print(f"  {out.any_name}: shape={out.partial_shape}, "
+          f"type={out.element_type}")
+
+# 序列化为 IR 格式 (.xml + .bin)
+ov.save_model(model, "realesrgan_x4plus.xml")
+print("Saved: realesrgan_x4plus.xml + realesrgan_x4plus.bin")
+```
+
+**方法 C：从 PyTorch 直接转换（跳过 ONNX，OpenVINO 2023.1+）**
+
+```python
+import torch
+import openvino as ov
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+# 构建模型并加载权重
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_block=23, num_grow_ch=32, scale=4)
+state_dict = torch.load('RealESRGAN_x4plus.pth', map_location='cpu')
+model.load_state_dict(state_dict.get('params_ema', state_dict))
+model.eval()
+
+# 直接从 PyTorch 转换为 OpenVINO IR
+# 参考: https://docs.openvino.ai/2024/openvino-workflow/model-preparation.html
+example_input = torch.rand(1, 3, 480, 640)
+ov_model = ov.convert_model(model, example_input=example_input,
+                             input=[1, 3, -1, -1])  # 动态空间维度
+ov.save_model(ov_model, "realesrgan_x4plus.xml")
+```
+
+#### 步骤 4：验证转换后的模型
+
+```python
+import numpy as np
+import openvino as ov
+
+core = ov.Core()
+model = core.read_model("realesrgan_x4plus.xml")
+
+# 查看详细信息
+for inp in model.inputs:
+    print(f"Input '{inp.any_name}': {inp.partial_shape} {inp.element_type}")
+for out in model.outputs:
+    print(f"Output '{out.any_name}': {out.partial_shape} {out.element_type}")
+
+# 编译并测试推理
+compiled = core.compile_model(model, "CPU")
+# 使用静态形状测试: [1, 3, 64, 64] → [1, 3, 256, 256]
+test_input = np.random.rand(1, 3, 64, 64).astype(np.float32)
+result = compiled([test_input])
+output = result[compiled.output(0)]
+print(f"Test inference: input {test_input.shape} → output {output.shape}")
+# 预期: (1, 3, 256, 256) — 4× 放大
+assert output.shape == (1, 3, 256, 256), f"Unexpected shape: {output.shape}"
+print("Model validation passed!")
+```
+
+预期输出：
+
+```
+Input 'input': [1,3,?,?] f32
+Output 'output': [1,3,?,?] f32
+Test inference: input (1, 3, 64, 64) → output (1, 3, 256, 256)
+Model validation passed!
+```
+
+转换完成后得到两个文件：
+- `realesrgan_x4plus.xml` — 模型结构（~350 KB）
+- `realesrgan_x4plus.bin` — 模型权重（~64 MB）
+
+### 13.4 FFmpeg 集成：调用链分析
+
+Real-ESRGAN x4plus 通过 `dnn_processing` 滤镜在 FFmpeg 中执行，走通用 DNN 推理路径。以下是具体的调用链：
+
+```
+┌─ FFmpeg 命令行 ─────────────────────────────────────────────┐
+│ ffmpeg -i input.mp4 -vf "format=rgb24,dnn_processing=..."  │
+└────────────────────────────┬────────────────────────────────┘
+                             ↓
+┌─ vf_dnn_processing.c ─────────────────────────────────────┐
+│ init()                                                      │
+│   → ff_dnn_init(&ctx->dnnctx, DFT_PROCESS_FRAME)          │
+│     → dnn_load_model_ov()                                   │
+│       → ov_core_create()                                    │
+│       → ov_core_read_model("realesrgan_x4plus.xml")        │
+│                                                              │
+│ config_output()                                             │
+│   → ff_dnn_get_output(&ctx->dnnctx)                        │
+│     → init_model_ov()                                       │
+│       → ov_preprocess: set NHWC input, scale=255           │
+│       → ov_core_compile_model(device="CPU")                │
+│       → 创建 request_queue (nireq 个推理请求)              │
+│   → prepare_uv_scale() [YUV 格式才触发]                    │
+│   注：输出尺寸 = 输入 × 4（模型的 4× 放大）               │
+│                                                              │
+│ activate() [每帧循环]                                       │
+│   → ff_inlink_consume_frame() 获取输入帧                   │
+│   → ff_get_video_buffer(outlink, out_w, out_h)             │
+│   → ff_dnn_execute_model()                                  │
+│     → execute_model_ov()                                    │
+│       → ff_proc_from_frame_to_dnn()  [帧→张量]             │
+│         → sws_scale(): RGB24→RGBPF32, /255归一化           │
+│       → ov_tensor_data() [零拷贝获取张量指针]              │
+│       → fill_model_input_ov() [写入输入数据]               │
+│       → ov_infer_request_start_async()                      │
+│                                                              │
+│   → ff_dnn_get_result()  [获取完成的推理]                  │
+│     → infer_completion_callback()                           │
+│       → ff_proc_from_dnn_to_frame()  [张量→帧]             │
+│         → sws_scale(): RGBPF32→RGB24, ×255反归一化         │
+│     → copy_uv_planes() [仅 YUV 格式]                       │
+│   → ff_filter_frame(outlink, out_frame)                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键参数映射到代码路径**：
+
+| FFmpeg 参数 | 代码处理位置 | 作用 |
+|-------------|-------------|------|
+| `model=realesrgan_x4plus.xml` | `dnn_load_model_ov()` → `ov_core_read_model()` | 加载 IR 模型 |
+| `input=input:output=output` | `execute_model_ov()` → `fill_model_input_ov()` | 指定输入/输出节点名 |
+| `layout=nchw` | `init_model_ov()` L652-666 | 设置模型期望的 NCHW 布局 |
+| `scale=255` | `init_model_ov()` L720-741 → `ov_preprocess_preprocess_steps_scale()` | OpenVINO 预处理归一化 |
+| `input_resizable=1` | `init_model_ov()` L557 | 允许动态 reshape 输入维度 |
+| `async=1` | `execute_model_ov()` → `ov_infer_request_start_async()` | 异步推理 |
+| `nireq=2` | `init_model_ov()` → 创建 2 个 `OVRequestItem` | 推理请求管线深度 |
+
+### 13.5 FFmpeg 使用命令
+
+#### 13.5.1 基础用法（图片 SR）
+
+```bash
+# 单张图片 4× 超分辨率
+ffmpeg -i input.jpg -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:\
+   scale=255" \
+  -y output_4x.png
+```
+
+参数说明：
+- `format=rgb24`：将输入转换为 RGB24 格式（Real-ESRGAN 需要 3 通道 RGB 输入）
+- `dnn_backend=openvino`：使用 OpenVINO 推理后端
+- `model=realesrgan_x4plus.xml`：指向转换后的 IR 模型文件
+- `input=input:output=output`：ONNX/IR 模型的输入和输出节点名
+- `layout=nchw`：模型输入为 NCHW 布局（PyTorch 默认）
+- `scale=255`：将 [0,255] 像素值归一化到 [0,1]（Real-ESRGAN 训练时使用 [0,1] 范围）
+
+#### 13.5.2 视频 SR（异步流水线）
+
+```bash
+# 视频 4× 超分辨率（异步推理 + 多请求流水线）
+ffmpeg -i input_480p.mp4 -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:\
+   scale=255:\
+   async=1:\
+   nireq=4" \
+  -c:v libx264 -crf 18 -preset medium \
+  -y output_1920p.mp4
+```
+
+异步参数：
+- `async=1`：启用异步推理（`ov_infer_request_start_async()`）
+- `nireq=4`：4 个并行推理请求。更多请求可提高 GPU 利用率，但增加内存消耗
+
+#### 13.5.3 动态输入尺寸
+
+```bash
+# 支持任意输入分辨率（使用 input_resizable）
+ffmpeg -i input_any_size.jpg -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:\
+   scale=255:\
+   input_resizable=1" \
+  -y output_4x.png
+```
+
+> `input_resizable=1` 会在每次输入尺寸变化时调用 OpenVINO reshape API 重新配置模型维度。对于 ONNX 导出时已设置 `dynamic_axes` 的模型，这是必要的。
+
+#### 13.5.4 GPU 推理（Intel GPU）
+
+```bash
+# 使用 Intel 集成/独立 GPU 推理
+ffmpeg -i input.mp4 -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:\
+   scale=255:\
+   device=GPU:\
+   nireq=4:\
+   async=1" \
+  -y output_4x.mp4
+```
+
+#### 13.5.5 YUV 输入处理
+
+```bash
+# YUV420P 输入：仅 Y 通道送入 SR 模型，UV 通道单独缩放
+# 注意：Real-ESRGAN 是 RGB 模型，推荐使用 format=rgb24
+# 若必须使用 YUV 输入，FFmpeg 会自动处理 Y 通道的格式转换
+ffmpeg -i input.mp4 -vf \
+  "format=yuv420p,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:\
+   scale=255" \
+  -y output_4x.mp4
+```
+
+> ⚠ **推荐使用 `format=rgb24`**：Real-ESRGAN 在 RGB 域训练，使用 YUV 输入会导致仅处理 Y 通道，色彩信息仅通过 bicubic 插值放大，质量不如 RGB 全通道处理。
+
+### 13.6 数据流图解
+
+以 `format=rgb24` + `layout=nchw` + `scale=255` 配置，Real-ESRGAN x4plus 的完整数据流：
+
+```
+输入帧 (RGB24, H×W×3, uint8, [0,255])
+    │
+    ↓ format=rgb24 滤镜
+输入帧 (RGB24, H×W×3, uint8, [0,255])
+    │
+    ↓ ff_proc_from_frame_to_dnn() [dnn_io_proc.c]
+    │   sws_scale(): RGB24(HWC) → RGBPF32(planar, 3×H×W)
+    │   此步骤完成：
+    │     ① uint8 → float32 类型转换
+    │     ② packed HWC → planar CHW 布局转换
+    │
+DNN 输入张量 (float32, 1×3×H×W, NCHW, [0,255])
+    │
+    ↓ OpenVINO 预处理管线 [dnn_backend_openvino.c init_model_ov()]
+    │   ov_preprocess_preprocess_steps_scale(255)
+    │   完成：÷255 归一化
+    │
+模型输入 (float32, 1×3×H×W, NCHW, [0,1])
+    │
+    ↓ RRDBNet 推理 (23 RRDB blocks + PixelShuffle 4×)
+    │   ov_infer_request_start_async()
+    │
+模型输出 (float32, 1×3×4H×4W, NCHW, [0,1])
+    │
+    ↓ OpenVINO 后处理（隐式反归一化 ×255）
+    │
+DNN 输出张量 (float32, 3×4H×4W, planar, [0,255])
+    │
+    ↓ ff_proc_from_dnn_to_frame() [dnn_io_proc.c]
+    │   sws_scale(): RGBPF32(planar) → RGB24(packed)
+    │   完成：
+    │     ① float32 → uint8 类型转换
+    │     ② planar CHW → packed HWC 布局转换
+    │     ③ clip 到 [0,255]
+    │
+输出帧 (RGB24, 4H×4W×3, uint8, [0,255])
+```
+
+**数据复制次数**：RGB24+NCHW 配置总计 **2 次像素数据复制**（输入格式转换 1 次 + 输出格式转换 1 次），属于最优路径之一。
+
+### 13.7 性能优化
+
+#### 13.7.1 OpenVINO 优化选项
+
+可在编译模型时传入性能提示：
+
+```python
+import openvino as ov
+
+core = ov.Core()
+model = core.read_model("realesrgan_x4plus.xml")
+
+# FP16 量化（减少模型体积和推理时间，精度损失极小）
+from openvino.runtime import serialize
+from openvino.runtime.passes import Manager, ConvertFP32ToFP16
+
+manager = Manager()
+manager.register_pass(ConvertFP32ToFP16())
+manager.run_passes(model)
+serialize(model, "realesrgan_x4plus_fp16.xml")
+```
+
+或在导出时使用 FP16：
+
+```bash
+ovc realesrgan_x4plus.onnx \
+    --output_model realesrgan_x4plus_fp16.xml \
+    --compress_to_fp16
+```
+
+#### 13.7.2 FFmpeg 参数调优
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `nireq` | CPU: 2-4, GPU: 4-8 | 推理请求并行度 |
+| `async` | 1 | 始终启用异步 |
+| `device` | CPU / GPU | Intel GPU 可显著加速 |
+| `input_resizable` | 视情况 | 固定分辨率输入关闭可减少 reshape 开销 |
+
+#### 13.7.3 内存注意事项
+
+Real-ESRGAN x4plus（RRDBNet 23 blocks）内存消耗较大：
+
+| 输入分辨率 | 模型显存 (FP32) | 输出分辨率 |
+|-----------|----------------|-----------|
+| 64×64 | ~300 MB | 256×256 |
+| 480×640 | ~2-4 GB | 1920×2560 |
+| 720×1280 | ~6-10 GB | 2880×5120 |
+| 1080×1920 | >16 GB | 4320×7680 |
+
+> ⚠ 对于 720p 及以上输入，强烈建议使用 FP16 模型或考虑第 10 节的变通方案（先缩小输入、外部分块处理）。
+>
+> Real-ESRGAN 官方推理脚本（`inference_realesrgan.py`）支持 `--tile` 参数进行分块处理（tile_size + tile_pad 重叠边缘），但 FFmpeg 当前不支持此功能（参见 §10）。
+
+### 13.8 其他 Real-ESRGAN 模型变体集成
+
+#### RealESRGAN_x4plus_anime_6B（动漫图片，轻量版）
+
+```python
+# 导出脚本修改：6 个 RRDB blocks
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_block=6, num_grow_ch=32, scale=4)  # 注意 num_block=6
+state_dict = torch.load('RealESRGAN_x4plus_anime_6B.pth', map_location='cpu')
+model.load_state_dict(state_dict.get('params_ema', state_dict))
+```
+
+```bash
+# 权重下载
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth
+
+# FFmpeg 使用（与 x4plus 命令完全相同，只换模型文件）
+ffmpeg -i anime_input.jpg -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus_anime_6b.xml:\
+   input=input:output=output:\
+   layout=nchw:scale=255" \
+  -y anime_output_4x.png
+```
+
+#### realesr-animevideov3（动漫视频，极轻量）
+
+```python
+# 使用 SRVGGNetCompact 架构（非 RRDBNet）
+from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+
+model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
+                         num_conv=16, upscale=4, act_type='prelu')
+state_dict = torch.load('realesr-animevideov3.pth', map_location='cpu')
+model.load_state_dict(state_dict.get('params_ema', state_dict))
+```
+
+```bash
+# 权重下载
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
+
+# FFmpeg 使用（推荐用于视频，模型更小更快）
+ffmpeg -i anime_video.mp4 -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesr_animevideov3.xml:\
+   input=input:output=output:\
+   layout=nchw:scale=255:\
+   async=1:nireq=4" \
+  -c:v libx264 -crf 18 -y anime_video_4x.mp4
+```
+
+### 13.9 端到端验证
+
+#### 13.9.1 单帧验证
+
+```bash
+# 1. 生成测试图片
+ffmpeg -f lavfi -i testsrc=size=64x64:duration=1:rate=1 -frames:v 1 test_64x64.png
+
+# 2. 执行 SR
+ffmpeg -i test_64x64.png -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:scale=255" \
+  -y test_256x256.png
+
+# 3. 验证输出尺寸
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height test_256x256.png
+# 预期输出: width=256, height=256
+```
+
+#### 13.9.2 与 PyTorch 参考输出对比
+
+```python
+"""Compare FFmpeg+OpenVINO output with PyTorch reference."""
+import cv2
+import numpy as np
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+
+def pytorch_inference(image_path, weights_path):
+    """Run PyTorch reference inference."""
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = img.astype(np.float32) / 255.0
+    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)  # HWC→NCHW
+
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                    num_block=23, num_grow_ch=32, scale=4)
+    state_dict = torch.load(weights_path, map_location='cpu')
+    model.load_state_dict(state_dict.get('params_ema', state_dict))
+    model.eval()
+
+    with torch.no_grad():
+        output = model(img)
+
+    output = output.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+    output = (output * 255).round().astype(np.uint8)
+    return output
+
+
+def compare_outputs(pytorch_output, ffmpeg_output_path):
+    """Compare PyTorch and FFmpeg outputs."""
+    ffmpeg_out = cv2.imread(ffmpeg_output_path, cv2.IMREAD_COLOR)
+    diff = np.abs(pytorch_output.astype(float) - ffmpeg_out.astype(float))
+    print(f"Max pixel diff: {diff.max():.1f}")
+    print(f"Mean pixel diff: {diff.mean():.3f}")
+    print(f"PSNR: {10 * np.log10(255**2 / (diff**2).mean()):.2f} dB")
+    # 允许 FP32 精度差异: max diff 通常 < 2, PSNR > 50 dB
+
+
+pytorch_out = pytorch_inference("test_64x64.png", "RealESRGAN_x4plus.pth")
+compare_outputs(pytorch_out, "test_256x256.png")
+```
+
+### 13.10 完整操作一览
+
+```bash
+# ========== 一次性完整流程 ==========
+
+# 1. 下载权重
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+# 2. 安装依赖
+pip install torch basicsr openvino-dev[onnx]
+
+# 3. 导出 ONNX
+python -c "
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+sd = torch.load('RealESRGAN_x4plus.pth', map_location='cpu')
+model.load_state_dict(sd.get('params_ema', sd))
+model.eval()
+torch.onnx.export(model, torch.rand(1,3,64,64), 'realesrgan_x4plus.onnx',
+    input_names=['input'], output_names=['output'],
+    dynamic_axes={'input':{2:'h',3:'w'}, 'output':{2:'h',3:'w'}}, opset_version=11)
+print('ONNX export done')
+"
+
+# 4. 转换为 OpenVINO IR
+python -c "
+import openvino as ov
+model = ov.Core().read_model('realesrgan_x4plus.onnx')
+ov.save_model(model, 'realesrgan_x4plus.xml')
+print('OpenVINO IR saved')
+"
+
+# 5. FFmpeg 超分辨率
+ffmpeg -i input.jpg -vf \
+  "format=rgb24,\
+   dnn_processing=dnn_backend=openvino:\
+   model=realesrgan_x4plus.xml:\
+   input=input:output=output:\
+   layout=nchw:scale=255" \
+  -y output_4x.png
+
+# 6. 验证输出
+ffprobe -v error -show_entries stream=width,height output_4x.png
+```
+
+---
+
+*本文档基于 FFmpeg 源码分析生成，涵盖了 libavfilter → DNN Interface → OpenVINO Backend → OpenVINO C Library 的完整调用链，以及新图像 SR 模型的集成方法。第 13 节参考了 [Real-ESRGAN 官方仓库](https://github.com/xinntao/Real-ESRGAN) 和 [OpenVINO 文档](https://docs.openvino.ai/)。*
