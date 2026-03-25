@@ -1150,6 +1150,53 @@ if (isPlanarYUV(in_frame->format))
 > - **是否 SR**：SR 场景需要 UV 缩放而非直接复制
 > - 选择 `RGB24 + NHWC` 可以获得最少的复制次数（2 次像素复制 + 1 次属性复制）
 
+#### 8.5.6 FFmpeg 预处理 vs OpenVINO 预处理模块对比
+
+OpenVINO 自带完善的预处理 API（`ov_preprocess_*`），FFmpeg 后端已部分使用。以下分析哪些预处理已委托给 OpenVINO、哪些仍由 FFmpeg 自行处理、以及原因。
+
+**① FFmpeg 已委托给 OpenVINO 的预处理（`dnn_backend_openvino.c` L612-750）：**
+
+| 预处理操作 | OpenVINO API 调用 | FFmpeg 代码行号 | 说明 |
+|-----------|-------------------|---------------|------|
+| 布局转换 NHWC↔NCHW | `ov_preprocess_input_tensor_info_set_layout(NHWC)` + `ov_preprocess_input_model_info_set_layout()` | L645, L659/661 | 输入声明为 NHWC，模型布局按用户 `layout` 选项设置 |
+| 元素类型 U8→F32 | `ov_preprocess_preprocess_steps_convert_element_type(F32)` | L729 | 仅在 `scale≠1` 或 `mean≠0` 时启用 |
+| 均值减除 | `ov_preprocess_preprocess_steps_mean()` | L730 | 由用户 `mean` 选项控制 |
+| 缩放归一化 | `ov_preprocess_preprocess_steps_scale()` | L731 | 由用户 `scale` 选项控制（默认 255） |
+| 输入类型声明 | `ov_preprocess_input_tensor_info_set_element_type(U8)` | L668 | 始终声明输入为 U8 |
+| 输出类型设置 | `ov_preprocess_output_set_element_type()` | L705-709 | F32（检测/归一化场景）或 U8 |
+
+**② FFmpeg 仍自行处理的预处理（无法委托给 OpenVINO）：**
+
+| 预处理操作 | FFmpeg 实现 | 不能委托的原因 |
+|-----------|------------|--------------|
+| **色彩空间转换**（YUV→RGB、RGB↔BGR、NV12→RGB） | `sws_scale()` in `dnn_io_proc.c` L258-310 | OpenVINO preprocessing API 中 **无色彩空间转换函数**；FFmpeg 输入帧可能是任意 YUV/NV12 格式，必须在送入模型前转换 |
+| **UV 通道复制/缩放** | `av_image_copy_plane()` / `sws_scale()` in `vf_dnn_processing.c` L233-244 | YUV 格式的 U/V 平面仅由 FFmpeg 管理；DNN 模型只处理 Y（或 RGB），UV 需要 FFmpeg 单独复制或缩放到输出 |
+| **packed↔planar 格式转换**（RGB24→GBRP） | `sws_scale()` in `dnn_io_proc.c` L227-256 | 这是 FFmpeg 特有的像素格式变换，OpenVINO 的布局转换（NHWC↔NCHW）不等同于 packed↔planar 转换 |
+| **空间缩放/Resize** | `sws_scale()` in `vf_dnn_processing.c` L238-244 | FFmpeg 后端未调用 `ov_preprocess_preprocess_steps_resize()`；SR 场景的 UV 缩放由 FFmpeg 的 `copy_uv_planes()` 处理 |
+
+**③ 存在冗余的操作（FFmpeg 和 OpenVINO 双重处理）：**
+
+| 操作 | FFmpeg 做了什么 | OpenVINO 做了什么 | 冗余说明 |
+|------|---------------|-----------------|---------|
+| **布局转换** | `dnn_io_proc.c` L212-220: 为 NCHW 分配 `middle_data` 缓冲区并手动重排通道 | L645/659: 在预处理管线中声明 NHWC→NCHW 转换 | FFmpeg 可能在 `dnn_io_proc.c` 中做了不必要的手动转置，因为 OpenVINO 管线已配置了同样的转换 |
+| **元素类型转换** | `sws_scale()` 隐式执行 UINT8↔FLOAT 转换 | L668/729: 显式声明 U8 输入并转换为 F32 | 当 OpenVINO 已处理归一化时，`sws_scale()` 的类型转换部分可能是多余的 |
+
+**④ 综合评估——FFmpeg 层的预处理是否仍然需要？**
+
+| 类别 | 结论 |
+|------|------|
+| **色彩空间转换** | **必须由 FFmpeg 处理**。OpenVINO preprocessing 没有色彩空间转换 API。FFmpeg 视频帧的 YUV/NV12 格式必须在 FFmpeg 层转换为模型所需的 RGB/GRAY 格式。 |
+| **UV 通道处理** | **必须由 FFmpeg 处理**。DNN 模型只处理亮度或 RGB，色度平面完全在 FFmpeg 的职责范围内。 |
+| **归一化（scale/mean）** | **已委托给 OpenVINO**。FFmpeg 将用户的 `scale`/`mean` 参数传递给 `ov_preprocess_preprocess_steps_scale/mean()`，由 OpenVINO 在推理管线内部执行，可能利用硬件加速。 |
+| **布局转换** | **部分冗余**。FFmpeg 在 `dnn_io_proc.c` 中手动做 packed→planar 重排，同时 OpenVINO 管线也配置了 NHWC→NCHW。理论上可以简化 FFmpeg 侧的处理，但需验证 OpenVINO 的转换是否完全覆盖 packed 格式。 |
+| **Resize** | **必须由 FFmpeg 处理**。FFmpeg 后端未启用 OpenVINO 的 resize preprocessing（未调用 `ov_preprocess_preprocess_steps_resize()`），UV 缩放完全由 `copy_uv_planes()` 负责。 |
+
+> **总结**：OpenVINO 的预处理模块已被 FFmpeg 用于**归一化和布局声明**（约 40% 的预处理工作量）。但 FFmpeg 层的 `sws_scale()` 预处理**仍然不可替代**，主要原因：
+> 1. **色彩空间转换**是 FFmpeg 独有需求（视频帧格式多样，OpenVINO API 不支持）
+> 2. **YUV 色度通道**完全在 DNN 推理范围之外，只能由 FFmpeg 管理
+> 3. **布局转换存在部分冗余**，是潜在的优化方向——若能确保 OpenVINO 管线完整处理 packed→planar 转换，可移除 `dnn_io_proc.c` 中的手动缓冲区重排
+> 4. **Resize 预处理**可考虑委托给 OpenVINO（调用 `ov_preprocess_preprocess_steps_resize()`），减少 FFmpeg 侧的 `sws_scale()` 调用
+
 ---
 
 ## 9. 异步执行机制
