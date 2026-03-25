@@ -1100,6 +1100,56 @@ if (isPlanarYUV(in_frame->format))
 - 输出路径：反归一化（1次） → planar GBR → packed RGB（1次）= 2 次
 - 总计约 **5-6 次数据复制操作**
 
+#### 8.5.5 数据复制的必要性分析
+
+并非所有复制操作都是必须的——部分取决于像素格式、模型布局和输入输出尺寸等配置条件。
+
+**① 始终必须的复制（架构性需求）：**
+
+| 操作 | 原因 |
+|------|------|
+| `av_frame_copy_props()` | 帧属性（pts、时间戳等）必须从输入帧传递到输出帧，任何配置下都执行 |
+| `sws_scale()` — RGB24/BGR24 格式转换 | DNN 模型要求 float 归一化输入，UINT8↔FLOAT 类型转换不可避免 |
+| `sws_scale()` — NCHW packed→planar 转换 | NCHW 布局要求通道分离存储，packed RGB 必须重排为 planar GBR |
+| `sws_scale()` — YUV/GRAY8 → GRAYF32 | Y 通道的 UINT8→FLOAT 类型转换 + scale/mean 归一化 |
+| `ov_tensor_data()` + `ff_proc_from_frame_to_dnn()` | 帧数据必须写入 OpenVINO 张量内存，架构上不可避免 |
+
+**② 仅在特定配置下触发的复制：**
+
+| 操作 | 触发条件 | 不触发的场景 |
+|------|---------|-------------|
+| `copy_uv_planes()` — UV 平面复制/缩放 | 仅 planar YUV 格式（YUV420P/422P/444P/NV12 等） | RGB24/BGR24/GRAY8/GRAYF32 格式无 UV 通道，**完全跳过** |
+| `av_image_copy_plane()` — UV 直接复制 | planar YUV + 输入输出尺寸相同（非 SR 场景，如去噪） | SR 场景尺寸一定变化，走 sws_scale 缩放路径 |
+| `sws_scale()` — UV 缩放 | planar YUV + 输入输出尺寸不同（典型 SR 场景） | 尺寸相同时走 av_image_copy_plane 直接复制 |
+| `sws_scale()` — NCHW 额外转换 | `layout=nchw` 配置（PyTorch 导出模型的默认布局） | `layout=nhwc`（TensorFlow 模型）跳过 packed↔planar 转换，**少 1-2 次复制** |
+| `av_image_copy_plane()` — GRAYF32 直通 | GRAYF32 格式 + `scale∈{0,1,255}` + `mean=0` + `dt=DNN_FLOAT` | 其他格式走 sws_scale 路径 |
+
+**③ 不同配置下的复制次数对比：**
+
+| 配置 | 像素复制次数 | 说明 |
+|------|------------|------|
+| **GRAYF32 + NHWC + 非 SR** | **2 次** | 输入 av_image_copy_plane + 输出 av_image_copy_plane（最少的像素复制） |
+| **GRAY8 + NHWC + 非 SR** | **2 次** | 输入 sws_scale(GRAY8→float) + 输出 sws_scale(float→GRAY8) |
+| **RGB24 + NHWC + 非 SR** | **2 次** | 输入 sws_scale + 输出 sws_scale |
+| **RGB24 + NCHW + 非 SR** | **4 次** | 输入(packed→planar + 归一化) + 输出(反归一化 + planar→packed) |
+| **YUV420P + 任意 + SR(4x)** | **4 次** | Y 输入转换 + Y 输出转换 + U 缩放 + V 缩放 |
+| **RGB24 + NCHW + SR(4x)** | **4 次** | 与非 SR 相同（RGB 无 UV 通道需要处理） |
+
+**④ 理论上可优化但当前代码未实现的场景：**
+
+| 优化方向 | 说明 | 当前状态 |
+|---------|------|---------|
+| GRAYF32 零拷贝 | 若模型直接接受 GRAYF32 且无需 scale/mean，可让 tensor 直接引用帧内存 | 当前仍使用 `av_image_copy_plane()` 做内存复制 |
+| NHWC + scale=1 + mean=0 直通 | RGB24 输入若模型接受 UINT8 NHWC，理论上无需转换 | 当前 `sws_scale()` 仍会执行（即使是 identity 转换） |
+| OpenVINO 远程张量 | 使用 `ov_remote_tensor` 直接映射 GPU 内存，避免 host↔device 复制 | FFmpeg 后端未使用此 API |
+| 输入帧内存对齐 | 若帧内存布局与张量布局完全匹配，可直接设置张量指针 | OpenVINO 张量由 `ov_tensor_create()` 独立分配 |
+
+> **结论**：对于 SR 场景，大部分数据复制是**架构性必须的**（格式转换 + 归一化）。主要的配置变量是：
+> - **像素格式**：RGB 无 UV 开销，YUV 需要额外的 UV 复制/缩放
+> - **模型布局**：NHWC 比 NCHW 少 1-2 次转换
+> - **是否 SR**：SR 场景需要 UV 缩放而非直接复制
+> - 选择 `RGB24 + NHWC` 可以获得最少的复制次数（2 次像素复制 + 1 次属性复制）
+
 ---
 
 ## 9. 异步执行机制
