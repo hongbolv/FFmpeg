@@ -1818,6 +1818,68 @@ ffmpeg -i input.mp4 -vf \
   -y output_swinir.mp4
 ```
 
+### 11.6 FFmpeg 代码库中已有的 SR 示例
+
+FFmpeg 代码库中包含以下 SR 相关的示例和参考资源：
+
+#### ① 专用 SR 滤镜：`vf_sr.c`
+
+`libavfilter/vf_sr.c`（约 200 行）是一个专门的超分辨率滤镜，内置支持两种经典 SR 模型：
+
+| 模型 | 论文 | 特点 |
+|------|------|------|
+| **SRCNN** | [arXiv:1501.00092](https://arxiv.org/abs/1501.00092) | 需要先双三次上采样，再用 CNN 增强（scale_factor=2/3/4） |
+| **ESPCN** | [arXiv:1609.05158](https://arxiv.org/abs/1609.05158) | 子像素卷积，直接从低分辨率输出高分辨率，无需预放大 |
+
+使用示例（来自 `doc/filters.texi`）：
+```bash
+# 使用 sr 滤镜 + SRCNN 模型
+ffmpeg -i input.jpg -vf sr=dnn_backend=tensorflow:model=srcnn.pb:scale_factor=2 output.jpg
+```
+
+> **注意**：`sr` 滤镜功能较简单（仅支持 TensorFlow 后端，不支持异步）。官方文档建议使用更通用的 `dnn_processing` 滤镜以获得完整功能。
+
+#### ② `doc/filters.texi` 中的 dnn_processing 示例
+
+官方文档（`doc/filters.texi` L12252-12265）提供了两个完整的 SR 示例：
+
+**SRCNN — Y 通道处理（YUV420P）：**
+```bash
+# 先双三次放大 2x，再用 SRCNN 增强
+./ffmpeg -i 480p.jpg -vf \
+  format=yuv420p,scale=w=iw*2:h=ih*2,\
+  dnn_processing=dnn_backend=tensorflow:model=srcnn.pb:input=x:output=y \
+  -y srcnn.jpg
+```
+
+**ESPCN — 直接放大（YUV420P）：**
+```bash
+# ESPCN 自动改变帧尺寸，无需预放大
+./ffmpeg -i 480p.jpg -vf \
+  format=yuv420p,\
+  dnn_processing=dnn_backend=tensorflow:model=espcn.pb:\
+  input=x:output=y:\
+  backend_configs=sess_config=0x10022805320e09cdccccccccccec3f20012a01303801 \
+  -y tmp.espcn.jpg
+```
+
+#### ③ 模型训练脚本（外部仓库）
+
+FFmpeg 官方文档引用了两个外部模型训练仓库：
+- **FFmpeg 适配版**：https://github.com/XueweiMeng/sr/tree/sr_dnn_native — 包含 SRCNN/ESPCN 训练脚本和 `.pb` 模型导出脚本
+- **原始仓库**：https://github.com/HighVoltageRocknRoll/sr.git
+
+#### ④ 代码库中的关键说明
+
+| 项目 | 说明 |
+|------|------|
+| **预置模型文件** | ❌ 无。FFmpeg 不包含任何 `.pb`/`.xml`/`.onnx` 模型文件，用户需自行准备 |
+| **FATE 测试** | ❌ 无 SR 专用 FATE 测试。DNN 相关测试需要外部模型文件和后端库 |
+| **通用 vs 专用** | `dnn_processing` 滤镜是通用的 DNN 推理入口，支持所有后端（TF/OpenVINO/LibTorch）和所有 SR 模型；`sr` 滤镜仅支持 SRCNN/ESPCN + TensorFlow |
+| **配置工具** | `tools/python/tf_sess_config.py` — 生成 TensorFlow session 序列化配置（GPU/线程优化） |
+
+> **总结**：FFmpeg 代码库中有 `vf_sr.c` 专用滤镜和 `doc/filters.texi` 中的 SRCNN/ESPCN 示例。但这些示例仅使用 TensorFlow 后端和经典模型。对于现代 SR 模型（Real-ESRGAN、SwinIR 等），需使用 `dnn_processing` 滤镜 + OpenVINO 后端，参见本文 §11.5 的集成示例。
+
 ---
 
 ## 12. 附录：关键数据结构参考
