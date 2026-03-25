@@ -1586,7 +1586,7 @@ ffmpeg -i input.mp4 -vf \
 
 ### 11.3 高级集成场景
 
-#### 10.3.1 使用 GPU 推理
+#### 11.3.1 使用 GPU 推理
 
 ```bash
 ffmpeg -i input.mp4 -vf \
@@ -1597,7 +1597,7 @@ ffmpeg -i input.mp4 -vf \
   -y output.mp4
 ```
 
-#### 10.3.2 批处理推理
+#### 11.3.2 批处理推理
 
 ```bash
 # OpenVINO 2.0 暂不支持 batch_size > 1
@@ -1610,7 +1610,7 @@ ffmpeg -i input.mp4 -vf \
   -y output.mp4
 ```
 
-#### 10.3.3 与其他滤镜组合
+#### 11.3.3 与其他滤镜组合
 
 ```bash
 # SR + 去噪 + 锐化 管道
@@ -1669,20 +1669,23 @@ ffmpeg -i input.mp4 -vf \
 
 **模型准备步骤**：
 
-```bash
-# 1. 获取 Real-ESRGAN 的 PyTorch 模型
-# 2. 导出为 ONNX
-python -c "
+```python
+# export_realesrgan.py — 导出 Real-ESRGAN 为 ONNX
 import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
-model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_block=23, num_grow_ch=32, scale=4)
 model.load_state_dict(torch.load('RealESRGAN_x4plus.pth')['params_ema'])
 model.eval()
-torch.onnx.export(model, torch.randn(1,3,64,64), 'realesrgan_x4.onnx',
+torch.onnx.export(model, torch.randn(1, 3, 64, 64), 'realesrgan_x4.onnx',
                   input_names=['input'], output_names=['output'],
-                  dynamic_axes={'input':{2:'h',3:'w'}, 'output':{2:'h',3:'w'}})
-"
-# 3. 转换为 OpenVINO IR
+                  dynamic_axes={'input': {2: 'h', 3: 'w'},
+                                'output': {2: 'h', 3: 'w'}})
+```
+
+```bash
+# 转换为 OpenVINO IR 格式
 mo --input_model realesrgan_x4.onnx --output_dir ./
 ```
 
